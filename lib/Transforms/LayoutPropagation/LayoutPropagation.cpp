@@ -68,6 +68,7 @@ namespace mlir {
 namespace heir {
 
 using linalg::BatchMatmulOp;
+using linalg::BroadcastOp;
 using linalg::Conv1DNcwFcwOp;
 using linalg::Conv1DOp;
 using linalg::Conv2DNchwFchwOp;
@@ -76,6 +77,7 @@ using linalg::DotOp;
 using linalg::MatmulOp;
 using linalg::MatvecOp;
 using linalg::ReduceOp;
+using linalg::TransposeOp;
 using linalg::VecmatOp;
 using presburger::IntegerRelation;
 using secret::GenericOp;
@@ -274,6 +276,8 @@ struct LayoutPropagation : impl::LayoutPropagationBase<LayoutPropagation> {
   // Op-specific transfer functions
   LogicalResult visitOperation(CollapseShapeOp op);
   LogicalResult visitOperation(ExpandShapeOp op);
+  LogicalResult visitOperation(BroadcastOp op);
+  LogicalResult visitOperation(TransposeOp op);
   LogicalResult visitOperation(GenericOp op);
   LogicalResult visitOperation(ReduceOp op);
   LogicalResult visitOperation(Conv1DOp op);
@@ -302,6 +306,8 @@ struct LayoutPropagation : impl::LayoutPropagationBase<LayoutPropagation> {
   CompatibilityResult hasCompatibleArgumentLayouts(Operation* op);
 
   // Op-specific compatibility functions
+  CompatibilityResult hasCompatibleArgumentLayouts(BroadcastOp op);
+  CompatibilityResult hasCompatibleArgumentLayouts(TransposeOp op);
   CompatibilityResult hasCompatibleArgumentLayouts(DotOp op);
   CompatibilityResult hasCompatibleArgumentLayouts(Conv1DOp op);
   CompatibilityResult hasCompatibleArgumentLayouts(Conv1DNcwFcwOp op);
@@ -461,9 +467,9 @@ LogicalResult LayoutPropagation::visitOperation(Operation* op) {
       // secret ops
       .Case<GenericOp, YieldOp>([&](auto op) { return visitOperation(op); })
       // linalg ops
-      .Case<DotOp, MatvecOp, VecmatOp, ReduceOp, MatmulOp, BatchMatmulOp,
-            Conv1DOp, Conv1DNcwFcwOp, Conv2DOp, Conv2DNchwFchwOp>(
-          [&](auto op) { return visitOperation(op); })
+      .Case<DotOp, MatvecOp, VecmatOp, ReduceOp, BroadcastOp, TransposeOp,
+            MatmulOp, BatchMatmulOp, Conv1DOp, Conv1DNcwFcwOp, Conv2DOp,
+            Conv2DNchwFchwOp>([&](auto op) { return visitOperation(op); })
       // affine ops
       .Case<affine::AffineForOp>([&](auto op) { return visitOperation(op); })
       // tensor ops
@@ -485,7 +491,17 @@ LogicalResult LayoutPropagation::visitOperation(func::FuncOp op) {
       // assign_layout ops and materialized to plaintexts server-side.
       continue;
     }
-    FailureOr<LayoutAttr> layout = defaultLayoutForType(arg.getType());
+    FailureOr<LayoutAttr> layout = failure();
+    auto existingLayout = findAttributeAssociatedWith(
+        arg, tensor_ext::TensorExtDialect::kLayoutAttrName);
+    if (succeeded(existingLayout)) {
+      if (auto layoutAttr = dyn_cast<LayoutAttr>(*existingLayout)) {
+        layout = layoutAttr;
+      }
+    }
+    if (failed(layout)) {
+      layout = defaultLayoutForType(arg.getType());
+    }
     if (failed(layout)) {
       return op->emitOpError()
              << "Failed to assign default layout to func argument " << arg;
@@ -715,6 +731,86 @@ LogicalResult LayoutPropagation::visitOperation(VecmatOp op) {
       secret::KernelAttr::get(ctx, KernelName::VecmatDiagonal, /*force=*/false);
   op->setAttr(secret::SecretDialect::kKernelAttrName, kernelAttr);
 
+  return success();
+}
+
+LogicalResult LayoutPropagation::visitOperation(BroadcastOp op) {
+  auto input = op.getInput();
+  LayoutAttr inputLayout = getComposedLayoutAttr(input);
+  auto resultType = cast<RankedTensorType>(op.getResults()[0].getType());
+  MLIRContext* ctx = &getContext();
+
+  // The result layout is the input relation with one new free domain variable
+  // per broadcast dimension (bounded [0, size)), not otherwise constrained by
+  // the (ct, slot) map: every broadcasted index reads its source element's
+  // slot, so the packed data is unchanged and the broadcast itself materializes
+  // as a free view. A consumer that needs the operand in a materialized
+  // (bijective) layout gets a convert_layout via the ordinary rectification
+  // path.
+  IntegerRelation relation = inputLayout.getIntegerRelation();
+
+  SmallVector<int64_t> dims(op.getDimensions());
+  llvm::sort(dims);
+  for (int64_t dim : dims) {
+    unsigned newVar = relation.insertVar(presburger::VarKind::Domain, dim);
+    relation.addBound(presburger::BoundType::LB, newVar, 0);
+    relation.addBound(presburger::BoundType::UB, newVar,
+                      resultType.getDimSize(dim) - 1);
+  }
+
+  LayoutAttr resultLayoutAttr =
+      LayoutAttr::getFromIntegerRelation(ctx, relation);
+  assignedLayouts.insert({op.getResults()[0], resultLayoutAttr});
+  setResultLayoutAttr(op);
+  debugAssignLayout(op.getResults()[0], resultLayoutAttr);
+  return success();
+}
+
+LogicalResult LayoutPropagation::visitOperation(TransposeOp op) {
+  // The result layout is the input relation with its domain variables
+  // permuted: result index (j_0, ..., j_r) reads the slot of input index
+  // (j_perm[0], ..., j_perm[r]), so the packed data is unchanged and the
+  // transpose materializes as a retype. Consumers needing a materialized
+  // layout get a convert_layout from the ordinary rectification path.
+  auto input = op.getInput();
+  LayoutAttr inputLayout = getComposedLayoutAttr(input);
+  IntegerRelation relation = inputLayout.getIntegerRelation();
+
+  ArrayRef<int64_t> permutation = op.getPermutation();
+  unsigned domainOffset =
+      relation.getVarKindOffset(presburger::VarKind::Domain);
+  unsigned numDomain = permutation.size();
+
+  // Permute domain variables according to permutation array:
+  // Track current element positions to safely decompose arbitrary N-D
+  // permutations.
+  SmallVector<int64_t> posToElem(numDomain);
+  SmallVector<int64_t> elemToPos(numDomain);
+  for (unsigned i = 0; i < numDomain; ++i) {
+    posToElem[i] = i;
+    elemToPos[i] = i;
+  }
+  for (unsigned targetIdx = 0; targetIdx < numDomain; ++targetIdx) {
+    int64_t targetElem = permutation[targetIdx];
+    int64_t curPos = elemToPos[targetElem];
+    if (curPos != static_cast<int64_t>(targetIdx)) {
+      relation.swapVar(domainOffset + targetIdx, domainOffset + curPos);
+      int64_t elemAtTarget = posToElem[targetIdx];
+      posToElem[targetIdx] = targetElem;
+      posToElem[curPos] = elemAtTarget;
+      elemToPos[targetElem] = targetIdx;
+      elemToPos[elemAtTarget] = curPos;
+    }
+  }
+
+  MLIRContext* ctx = &getContext();
+  LayoutAttr resultLayoutAttr =
+      LayoutAttr::getFromIntegerRelation(ctx, relation);
+  auto kernelInfoAttr =
+      findAttributeAssociatedWith(input, kKernelInfoAttrName).value_or(nullptr);
+  assignedLayouts.insert({op.getResults()[0], resultLayoutAttr});
+  setResultLayoutAttr(op, kernelInfoAttr);
+  debugAssignLayout(op.getResults()[0], resultLayoutAttr);
   return success();
 }
 
@@ -1783,11 +1879,12 @@ CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
   return TypeSwitch<Operation*, CompatibilityResult>(op)
       // Trivially true ops
       .Case<func::FuncOp, GenericOp, YieldOp, affine::AffineForOp,
-            affine::AffineYieldOp>(
+            affine::AffineYieldOp, ConvertLayoutOp>(
           [&](auto op) { return CompatibilityResult{true, std::nullopt}; })
       // Ops with special rules
-      .Case<DotOp, ReduceOp, MatvecOp, VecmatOp, MatmulOp, Conv1DOp,
-            Conv1DNcwFcwOp, Conv2DOp, Conv2DNchwFchwOp, tensor::InsertSliceOp>(
+      .Case<BroadcastOp, TransposeOp, DotOp, ReduceOp, MatvecOp, VecmatOp,
+            MatmulOp, Conv1DOp, Conv1DNcwFcwOp, Conv2DOp, Conv2DNchwFchwOp,
+            tensor::InsertSliceOp>(
           [&](auto op) { return hasCompatibleArgumentLayouts(op); })
       // By default, assume operands must all have the same layout.
       .Default([&](Operation* op) {
@@ -1820,6 +1917,24 @@ CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
 
         return CompatibilityResult{true, std::nullopt};
       });
+}
+
+CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
+    BroadcastOp op) {
+  Value input = op.getInput();
+  if (!assignedLayouts.contains(input)) {
+    return {false, op->emitError("input operand has no assigned layout")};
+  }
+  return {true, std::nullopt};
+}
+
+CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
+    TransposeOp op) {
+  Value input = op.getInput();
+  if (!assignedLayouts.contains(input)) {
+    return {false, op->emitError("input operand has no assigned layout")};
+  }
+  return {true, std::nullopt};
 }
 
 CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(DotOp op) {
@@ -2030,8 +2145,8 @@ void LayoutPropagation::rectifyIncompatibleOperandLayouts(Operation* op) {
 
   TypeSwitch<Operation*>(op)
       // These ops shouldn't rectify operand layouts
-      .Case<func::FuncOp, func::ReturnOp, secret::GenericOp, secret::YieldOp>(
-          [&](auto op) { return; })
+      .Case<func::FuncOp, func::ReturnOp, secret::GenericOp, secret::YieldOp,
+            ConvertLayoutOp, BroadcastOp>([&](auto op) { return; })
       // Ops with special rules
       .Case<DotOp, ReduceOp, tensor::InsertOp, tensor::InsertSliceOp>(
           [&](auto op) { return rectifyIncompatibleOperandLayouts(op); })

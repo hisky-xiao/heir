@@ -829,6 +829,104 @@ struct ConvertLinalgDot : public ConversionBase<linalg::DotOp> {
   }
 };
 
+class ConvertLinalgBroadcastFreeView
+    : public ContextAwareOpConversionPattern<linalg::BroadcastOp> {
+ public:
+  using ContextAwareOpConversionPattern<
+      linalg::BroadcastOp>::ContextAwareOpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      linalg::BroadcastOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const final {
+    auto resultLayout =
+        dyn_cast_or_null<LayoutAttr>(op->getAttr(kLayoutAttrName));
+    if (!resultLayout) return failure();
+
+    LayoutAttr inputLayout = nullptr;
+    auto layoutLookup =
+        getTypeConverter()->getContextualAttr(adaptor.getInput());
+    if (succeeded(layoutLookup)) {
+      inputLayout = dyn_cast<LayoutAttr>(layoutLookup.value());
+    }
+    if (!inputLayout) {
+      auto attr =
+          findAttributeAssociatedWith(adaptor.getInput(), kLayoutAttrName);
+      if (succeeded(attr)) inputLayout = dyn_cast<LayoutAttr>(attr.value());
+    }
+
+    if (inputLayout) {
+      // Verify the free-view relation proof: the result relation must be a
+      // subset of the expected free broadcast relation (input relation with
+      // unbounded or bound-extended domain variables for the broadcasted dims).
+      auto resultType = cast<RankedTensorType>(op.getResults()[0].getType());
+      IntegerRelation expectedRel = inputLayout.getIntegerRelation();
+      SmallVector<int64_t> dims(op.getDimensions());
+      llvm::sort(dims);
+      for (int64_t dim : dims) {
+        unsigned newVar =
+            expectedRel.insertVar(presburger::VarKind::Domain, dim);
+        expectedRel.addBound(presburger::BoundType::LB, newVar, 0);
+        expectedRel.addBound(presburger::BoundType::UB, newVar,
+                             resultType.getDimSize(dim) - 1);
+      }
+
+      if (!resultLayout.getIntegerRelation().isSubsetOf(expectedRel)) {
+        return failure();
+      }
+    }
+
+    Type convertedResultType = getTypeConverter()->convertType(
+        op.getResults()[0].getType(), resultLayout);
+    if (!convertedResultType ||
+        convertedResultType != adaptor.getInput().getType())
+      return failure();
+
+    // Persist the result layout on a no-op cast; see ConvertLinalgTranspose.
+    auto castOp = UnrealizedConversionCastOp::create(
+        rewriter, op.getLoc(), convertedResultType, adaptor.getInput());
+    setMaterializedAttr(castOp);
+    setAttributeAssociatedWith(castOp.getResult(0), kLayoutAttrName,
+                               resultLayout);
+    rewriter.replaceOp(op, castOp);
+    return success();
+  };
+};
+
+// A linalg.transpose whose result layout was derived by layout propagation
+// (the input relation with permuted domain variables) packs to the exact
+// same ciphertext contents as its input; at ciphertext semantics the op is
+// a no-op forward, like the broadcast above.
+class ConvertLinalgTranspose
+    : public ContextAwareOpConversionPattern<linalg::TransposeOp> {
+ public:
+  using ContextAwareOpConversionPattern<
+      linalg::TransposeOp>::ContextAwareOpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      linalg::TransposeOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const final {
+    auto resultLayout =
+        dyn_cast_or_null<LayoutAttr>(op->getAttr(kLayoutAttrName));
+    if (!resultLayout) return failure();
+    Type convertedResultType = getTypeConverter()->convertType(
+        op.getResults()[0].getType(), resultLayout);
+    if (!convertedResultType ||
+        convertedResultType != adaptor.getInput().getType())
+      return failure();
+    // Persist the result layout on a no-op cast (mirroring the
+    // collapse/expand patterns): a bare forward leaves downstream
+    // consumers looking up the INPUT's contextual layout, whose domain
+    // order predates the transpose.
+    auto castOp = UnrealizedConversionCastOp::create(
+        rewriter, op.getLoc(), convertedResultType, adaptor.getInput());
+    setMaterializedAttr(castOp);
+    setAttributeAssociatedWith(castOp.getResult(0), kLayoutAttrName,
+                               resultLayout);
+    rewriter.replaceOp(op, castOp);
+    return success();
+  };
+};
+
 struct ConvertLinalgMatvecLayout : public ConversionBase<linalg::MatvecOp> {
  public:
   using ConversionBase<linalg::MatvecOp>::ConversionBase;
@@ -3082,13 +3180,13 @@ struct ConvertToCiphertextSemantics
 
     patterns.add<
         ConvertAnyAddingMaterializedAttr, ConvertBootstrap,
-        ConvertConvertLayout, ConvertFunc, ConvertLinalgMatmul,
-        ConvertLinalgBatchMatmul, ConvertLinalgReduce, ConvertLinalgDot,
-        ConvertSecretGeneric, ConvertTensorCollapseShape,
-        ConvertTensorExpandShape, ConvertTensorExtractLayout,
-        ConvertTensorExtractSlice, ConvertTensorPad, ConvertTensorInsertLayout,
-        ConvertTensorInsertSlice, PreserveLinalgMatvecAsLinearTransform>(
-        typeConverter, context);
+        ConvertConvertLayout, ConvertFunc, ConvertLinalgBroadcastFreeView,
+        ConvertLinalgMatmul, ConvertLinalgTranspose, ConvertLinalgBatchMatmul,
+        ConvertLinalgReduce, ConvertLinalgDot, ConvertSecretGeneric,
+        ConvertTensorCollapseShape, ConvertTensorExpandShape,
+        ConvertTensorExtractLayout, ConvertTensorExtractSlice, ConvertTensorPad,
+        ConvertTensorInsertLayout, ConvertTensorInsertSlice,
+        PreserveLinalgMatvecAsLinearTransform>(typeConverter, context);
     patterns.add<ConvertLinalgMatvecLayout, ConvertLinalgConv1D,
                  ConvertLinalgConv2D, ConvertLinalgConv2DNchwFchw,
                  ConvertLinalgConv1DNcwFcw>(typeConverter, context,

@@ -107,6 +107,22 @@ presburger::IntegerRelation getPeriodicReplicationRelation(
 presburger::IntegerRelation getPerRowLayoutRelation(RankedTensorType matrixType,
                                                     int64_t minSlotCount);
 
+// Returns the diagonal packing relation for the rank-3 plaintext operand
+// of the batch ciphertext-plaintext matmul:
+//   BatchDiag'(B, c)_k =
+//       B[k mod h][(k + c*ctBatch*ctStride) mod n][k mod paddedFreeDim]
+// contractionDim specifies the contraction axis (1 for ct-pt, 2 for pt-ct).
+presburger::IntegerRelation getTricyclicDiagonalRelation(
+    RankedTensorType weightType, int64_t ctBatch, int64_t ctStride,
+    int64_t paddedFreeDim, int64_t numSlots, int64_t contractionDim = 1);
+
+// Returns an IntegerRelation that maps each element of a tensor to slots
+// satisfying the cyclic congruence constraints slot = i_k (mod moduli[k]) for
+// each axis k.
+presburger::IntegerRelation getCyclicLayoutRelation(RankedTensorType tensorType,
+                                                    ArrayRef<int64_t> moduli,
+                                                    int64_t numSlots);
+
 // Returns true if the given relation is a squat diagonal layout for the given
 // matrix type and ciphertext semantic shape.
 bool isRelationSquatDiagonal(RankedTensorType matrixType, int64_t minSlotCount,
@@ -277,6 +293,11 @@ FailureOr<presburger::IntegerRelation> getSliceExtractionRelation(
 // return within 120s on layouts isl decides in single-digit milliseconds.
 bool isRelationEqual(const presburger::IntegerRelation& relation1,
                      const presburger::IntegerRelation& relation2);
+
+// Tests whether relation1 is a subset of relation2 (i.e. every point in
+// relation1 is also in relation2).
+bool isRelationSubset(const presburger::IntegerRelation& relation1,
+                      const presburger::IntegerRelation& relation2);
 
 // Returns true if the given relation is surjective onto the given tensor type.
 // This tests that the range set of the relation covers all points of the given

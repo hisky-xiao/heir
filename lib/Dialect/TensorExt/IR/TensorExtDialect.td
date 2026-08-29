@@ -22,6 +22,10 @@ def TensorExt_Dialect : Dialect {
         kLayoutAttrName = "tensor_ext.layout";
     constexpr const static ::llvm::StringLiteral
         kOriginalTypeAttrName = "tensor_ext.original_type";
+    // Carries the resolved ciphertext batch matmul period computed during
+    // layout propagation to ciphertext semantics conversion.
+    constexpr const static ::llvm::StringLiteral
+        kBatchMatmulPeriodAttrName = "tensor_ext.batch_matmul_period";
   }];
 
 

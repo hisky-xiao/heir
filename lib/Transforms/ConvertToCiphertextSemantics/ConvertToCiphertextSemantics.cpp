@@ -829,6 +829,104 @@ struct ConvertLinalgDot : public ConversionBase<linalg::DotOp> {
   }
 };
 
+class ConvertLinalgBroadcastFreeView
+    : public ContextAwareOpConversionPattern<linalg::BroadcastOp> {
+ public:
+  using ContextAwareOpConversionPattern<
+      linalg::BroadcastOp>::ContextAwareOpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      linalg::BroadcastOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const final {
+    auto resultLayout =
+        dyn_cast_or_null<LayoutAttr>(op->getAttr(kLayoutAttrName));
+    if (!resultLayout) return failure();
+
+    LayoutAttr inputLayout = nullptr;
+    auto layoutLookup =
+        getTypeConverter()->getContextualAttr(adaptor.getInput());
+    if (succeeded(layoutLookup)) {
+      inputLayout = dyn_cast<LayoutAttr>(layoutLookup.value());
+    }
+    if (!inputLayout) {
+      auto attr =
+          findAttributeAssociatedWith(adaptor.getInput(), kLayoutAttrName);
+      if (succeeded(attr)) inputLayout = dyn_cast<LayoutAttr>(attr.value());
+    }
+
+    if (inputLayout) {
+      // Verify the free-view relation proof: the result relation must be a
+      // subset of the expected free broadcast relation (input relation with
+      // unbounded or bound-extended domain variables for the broadcasted dims).
+      auto resultType = cast<RankedTensorType>(op.getResults()[0].getType());
+      IntegerRelation expectedRel = inputLayout.getIntegerRelation();
+      SmallVector<int64_t> dims(op.getDimensions());
+      llvm::sort(dims);
+      for (int64_t dim : dims) {
+        unsigned newVar =
+            expectedRel.insertVar(presburger::VarKind::Domain, dim);
+        expectedRel.addBound(presburger::BoundType::LB, newVar, 0);
+        expectedRel.addBound(presburger::BoundType::UB, newVar,
+                             resultType.getDimSize(dim) - 1);
+      }
+
+      if (!resultLayout.getIntegerRelation().isSubsetOf(expectedRel)) {
+        return failure();
+      }
+    }
+
+    Type convertedResultType = getTypeConverter()->convertType(
+        op.getResults()[0].getType(), resultLayout);
+    if (!convertedResultType ||
+        convertedResultType != adaptor.getInput().getType())
+      return failure();
+
+    // Persist the result layout on a no-op cast; see ConvertLinalgTranspose.
+    auto castOp = UnrealizedConversionCastOp::create(
+        rewriter, op.getLoc(), convertedResultType, adaptor.getInput());
+    setMaterializedAttr(castOp);
+    setAttributeAssociatedWith(castOp.getResult(0), kLayoutAttrName,
+                               resultLayout);
+    rewriter.replaceOp(op, castOp);
+    return success();
+  };
+};
+
+// A linalg.transpose whose result layout was derived by layout propagation
+// (the input relation with permuted domain variables) packs to the exact
+// same ciphertext contents as its input; at ciphertext semantics the op is
+// a no-op forward, like the broadcast above.
+class ConvertLinalgTranspose
+    : public ContextAwareOpConversionPattern<linalg::TransposeOp> {
+ public:
+  using ContextAwareOpConversionPattern<
+      linalg::TransposeOp>::ContextAwareOpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      linalg::TransposeOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const final {
+    auto resultLayout =
+        dyn_cast_or_null<LayoutAttr>(op->getAttr(kLayoutAttrName));
+    if (!resultLayout) return failure();
+    Type convertedResultType = getTypeConverter()->convertType(
+        op.getResults()[0].getType(), resultLayout);
+    if (!convertedResultType ||
+        convertedResultType != adaptor.getInput().getType())
+      return failure();
+    // Persist the result layout on a no-op cast (mirroring the
+    // collapse/expand patterns): a bare forward leaves downstream
+    // consumers looking up the INPUT's contextual layout, whose domain
+    // order predates the transpose.
+    auto castOp = UnrealizedConversionCastOp::create(
+        rewriter, op.getLoc(), convertedResultType, adaptor.getInput());
+    setMaterializedAttr(castOp);
+    setAttributeAssociatedWith(castOp.getResult(0), kLayoutAttrName,
+                               resultLayout);
+    rewriter.replaceOp(op, castOp);
+    return success();
+  };
+};
+
 struct ConvertLinalgMatvecLayout : public ConversionBase<linalg::MatvecOp> {
  public:
   using ConversionBase<linalg::MatvecOp>::ConversionBase;
@@ -2747,6 +2845,74 @@ struct DropRotateAndReduceUnitDims
   }
 };
 
+Operation* implementDiagonalMatmulKernel(
+    Operation* op, TypedValue<RankedTensorType> ct,
+    TypedValue<RankedTensorType> pt, Value init, int64_t period, int64_t steps,
+    int64_t dataNumElements, LayoutAttr layoutAttr,
+    ContextAwareConversionPatternRewriter& rewriter) {
+  SSAValue ctLeaf(ct);
+  SSAValue ptLeaf(pt);
+  auto ctType = ct.getType();
+
+  auto dagType = kernel::mlirTypeToDagType(ctType);
+  std::string reduceOp =
+      isa<FloatType>(ctType.getElementType()) ? "arith.addf" : "arith.addi";
+
+  std::shared_ptr<ArithmeticDagNode<SSAValue>> implementedKernel =
+      kernel::implementRotateAndReduce(ctLeaf, std::optional<SSAValue>(ptLeaf),
+                                       period, steps, dagType,
+                                       /*zeroDiagonals=*/{}, reduceOp);
+
+  rewriter.setInsertionPointAfter(op);
+  ImplicitLocOpBuilder b(op->getLoc(), rewriter);
+  IRMaterializingVisitor visitor(
+      ctType, [&](Operation* createdOp) { setMaterializedAttr(createdOp); });
+  Value finalOutput = visitor.process(implementedKernel, b)[0];
+
+  auto* finalOutputOp = finalOutput.getDefiningOp();
+  finalOutputOp->setAttr(kLayoutAttrName, layoutAttr);
+  setMaterializedAttr(finalOutputOp);
+
+  Operation* addBias =
+      makeAppropriatelyTypedAddOp(b, op->getLoc(), finalOutput, init);
+  addBias->setAttr(kLayoutAttrName, layoutAttr);
+  setMaterializedAttr(addBias);
+
+  int64_t reach = period * (steps - 1);
+  auto ctSemanticResultType =
+      cast<RankedTensorType>(addBias->getResult(0).getType());
+  int64_t validPrefix = ctSemanticResultType.getDimSize(1) - reach;
+  LLVM_DEBUG(llvm::dbgs() << "Diagonal matmul valid prefix: " << validPrefix
+                          << "\n");
+  Operation* replicated = replicateValidPrefixOfResult(
+      b, addBias->getResult(0), layoutAttr, dataNumElements, validPrefix);
+  setMaterializedAttr(replicated);
+  return replicated;
+}
+
+static bool detectSecretLhs(Operation* op, Value lhs, Value rhs) {
+  auto isCleartextPacked = [](Value v) {
+    return v.getDefiningOp<tensor_ext::AssignLayoutOp>() != nullptr;
+  };
+  if (isCleartextPacked(rhs) && !isCleartextPacked(lhs)) {
+    return true;
+  }
+  if (!isCleartextPacked(rhs) && isCleartextPacked(lhs)) {
+    return false;
+  }
+  if (auto genericOp = op->getParentOfType<secret::GenericOp>()) {
+    if (auto blockArg = dyn_cast<BlockArgument>(lhs)) {
+      if (blockArg.getArgNumber() < genericOp.getNumOperands()) {
+        auto opArg = genericOp.getOperand(blockArg.getArgNumber());
+        if (isa<secret::SecretType>(opArg.getType())) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 struct ConvertLinalgMatmul
     : public ContextAwareOpConversionPattern<linalg::MatmulOp> {
  public:
@@ -2787,78 +2953,27 @@ struct ConvertLinalgMatmul
                   "kernel: "
                << op << "\n");
 
-    // Determine if the lhs or rhs is the secret operand.
-    bool secretLhs = false;
-    auto genericOp = op->getParentOfType<secret::GenericOp>();
-    if (genericOp) {
-      if (auto blockArg = dyn_cast<BlockArgument>(op.getInputs()[0])) {
-        if (blockArg.getArgNumber() < genericOp.getNumOperands()) {
-          auto opArg = genericOp.getOperand(blockArg.getArgNumber());
-          if (isa<secret::SecretType>(opArg.getType())) {
-            secretLhs = true;
-          }
-        }
-      }
-    }
+    // Determine if the lhs or rhs is the secret operand. The cleartext
+    // weight always arrives through a tensor_ext.assign_layout (its
+    // diagonal packing); the secret operand never does. This also covers
+    // secret operands that are intermediate values rather than direct
+    // block arguments of the enclosing generic.
+    bool secretLhs = detectSecretLhs(op, op.getInputs()[0], op.getInputs()[1]);
 
     TypedValue<RankedTensorType> ct = cast<TypedValue<RankedTensorType>>(
         adaptor.getInputs()[secretLhs ? 0 : 1]);
-    SSAValue ctLeaf(ct);
     TypedValue<RankedTensorType> pt = cast<TypedValue<RankedTensorType>>(
         adaptor.getInputs()[secretLhs ? 1 : 0]);
-    SSAValue ptLeaf(pt);
-
     auto lhsType = cast<RankedTensorType>(op.getInputs()[0].getType());
     auto rhsType = cast<RankedTensorType>(op.getInputs()[1].getType());
-    auto secretType = ct.getType();
-
-    auto dagType = kernel::mlirTypeToDagType(secretType);
     int64_t period = secretLhs ? lhsType.getDimSize(0) : rhsType.getDimSize(1);
     int64_t steps = secretLhs ? lhsType.getDimSize(1) : rhsType.getDimSize(0);
-    std::string reduceOp = isa<FloatType>(secretType.getElementType())
-                               ? "arith.addf"
-                               : "arith.addi";
-
-    std::shared_ptr<ArithmeticDagNode<SSAValue>> implementedKernel =
-        implementRotateAndReduce(ctLeaf, std::optional<SSAValue>(ptLeaf),
-                                 period, steps, dagType, /*zeroDiagonals=*/{},
-                                 reduceOp);
-
-    rewriter.setInsertionPointAfter(op);
-    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
-    IRMaterializingVisitor visitor(ct.getType(), [&](Operation* createdOp) {
-      setMaterializedAttr(createdOp);
-    });
-    Value finalOutput = visitor.process(implementedKernel, b)[0];
-
-    auto layoutAttr = cast<LayoutAttr>(op->getAttr(kLayoutAttrName));
-    auto* finalOutputOp = finalOutput.getDefiningOp();
-    finalOutputOp->setAttr(kLayoutAttrName, layoutAttr);
-    setMaterializedAttr(finalOutputOp);
-
-    // Add the initial accumulator value.
-    Value result = adaptor.getOutputs()[0];
-
-    Operation* addBias =
-        makeAppropriatelyTypedAddOp(b, op->getLoc(), finalOutput, result);
-    addBias->setAttr(kLayoutAttrName, layoutAttr);
-    setMaterializedAttr(addBias);
-
-    // Rebuild the full periodic output layout from the widest valid
-    // period-aligned window. The rotation reach of rotate-and-reduce with
-    // `steps` iterations of stride `period` is period * (steps - 1).
     auto dataSemanticResultType =
         cast<RankedTensorType>(op->getResult(0).getType());
-    int64_t reach = period * (steps - 1);
-    auto ctSemanticResultType =
-        cast<RankedTensorType>(addBias->getResult(0).getType());
-    int64_t validPrefix = ctSemanticResultType.getDimSize(1) - reach;
-    LLVM_DEBUG(llvm::dbgs() << "Bicyclic diagonal matmul valid prefix: "
-                            << validPrefix << "\n");
-    Operation* replicated = replicateValidPrefixOfResult(
-        b, addBias->getResult(0), layoutAttr,
-        dataSemanticResultType.getNumElements(), validPrefix);
-    setMaterializedAttr(replicated);
+    auto layoutAttr = cast<LayoutAttr>(op->getAttr(kLayoutAttrName));
+    Operation* replicated = implementDiagonalMatmulKernel(
+        op, ct, pt, adaptor.getOutputs()[0], period, steps,
+        dataSemanticResultType.getNumElements(), layoutAttr, rewriter);
     rewriter.replaceOp(op, replicated);
   }
 
@@ -2990,8 +3105,9 @@ struct ConvertLinalgBatchMatmul
 
     rewriter.setInsertionPointAfter(op);
     ImplicitLocOpBuilder b(op.getLoc(), rewriter);
-    IRMaterializingVisitor visitor(
-        lhs.getType(), [&](Operation* createdOp) { setMaterializedAttr(op); });
+    IRMaterializingVisitor visitor(lhs.getType(), [&](Operation* createdOp) {
+      setMaterializedAttr(createdOp);
+    });
     Value finalOutput = visitor.process(implementedKernel, b)[0];
 
     auto layoutAttr = cast<LayoutAttr>(op->getAttr(kLayoutAttrName));
@@ -3028,9 +3144,57 @@ struct ConvertLinalgBatchMatmul
     rewriter.replaceOp(op, replicated);
   }
 
+  bool supportsTricyclicDiagonal(linalg::BatchMatmulOp op) const {
+    auto kernelAttr = op->getAttrOfType<secret::KernelAttr>(
+        secret::SecretDialect::kKernelAttrName);
+    return kernelAttr &&
+           kernelAttr.getName() == KernelName::BatchMatmulTricyclicDiagonal;
+  }
+
+  // Ciphertext-plaintext batch matmul using tricyclic diagonal
+  // rotate-and-reduce.
+  LogicalResult tricyclicDiagonalBatchKernel(
+      linalg::BatchMatmulOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const {
+    LLVM_DEBUG(llvm::dbgs()
+               << "Converting linalg.batch_matmul with tricyclic diagonal "
+                  "kernel: "
+               << op << "\n");
+
+    bool secretLhs = detectSecretLhs(op, op.getInputs()[0], op.getInputs()[1]);
+
+    TypedValue<RankedTensorType> ct = cast<TypedValue<RankedTensorType>>(
+        adaptor.getInputs()[secretLhs ? 0 : 1]);
+    TypedValue<RankedTensorType> pt = cast<TypedValue<RankedTensorType>>(
+        adaptor.getInputs()[secretLhs ? 1 : 0]);
+
+    auto lhsType = cast<RankedTensorType>(op.getInputs()[0].getType());
+    int64_t n = lhsType.getDimSize(2);
+
+    auto periodAttr = op->getAttrOfType<IntegerAttr>(
+        tensor_ext::TensorExtDialect::kBatchMatmulPeriodAttrName);
+    if (!periodAttr) {
+      return op->emitOpError("missing required batch matmul period attribute");
+    }
+    int64_t period = periodAttr.getInt();
+    int64_t steps = n;
+
+    auto dataSemanticResultType =
+        cast<RankedTensorType>(op->getResult(0).getType());
+    auto layoutAttr = cast<LayoutAttr>(op->getAttr(kLayoutAttrName));
+    Operation* replicated = implementDiagonalMatmulKernel(
+        op, ct, pt, adaptor.getOutputs()[0], period, steps,
+        dataSemanticResultType.getNumElements(), layoutAttr, rewriter);
+    rewriter.replaceOp(op, replicated);
+    return success();
+  }
+
   LogicalResult matchAndRewrite(
       linalg::BatchMatmulOp op, OpAdaptor adaptor,
       ContextAwareConversionPatternRewriter& rewriter) const final {
+    if (supportsTricyclicDiagonal(op)) {
+      return tricyclicDiagonalBatchKernel(op, adaptor, rewriter);
+    }
     if (supportsTricyclic(op, adaptor)) {
       tricyclicKernel(op, adaptor, rewriter);
       return success();
@@ -3082,13 +3246,13 @@ struct ConvertToCiphertextSemantics
 
     patterns.add<
         ConvertAnyAddingMaterializedAttr, ConvertBootstrap,
-        ConvertConvertLayout, ConvertFunc, ConvertLinalgMatmul,
-        ConvertLinalgBatchMatmul, ConvertLinalgReduce, ConvertLinalgDot,
-        ConvertSecretGeneric, ConvertTensorCollapseShape,
-        ConvertTensorExpandShape, ConvertTensorExtractLayout,
-        ConvertTensorExtractSlice, ConvertTensorPad, ConvertTensorInsertLayout,
-        ConvertTensorInsertSlice, PreserveLinalgMatvecAsLinearTransform>(
-        typeConverter, context);
+        ConvertConvertLayout, ConvertFunc, ConvertLinalgBroadcastFreeView,
+        ConvertLinalgMatmul, ConvertLinalgTranspose, ConvertLinalgBatchMatmul,
+        ConvertLinalgReduce, ConvertLinalgDot, ConvertSecretGeneric,
+        ConvertTensorCollapseShape, ConvertTensorExpandShape,
+        ConvertTensorExtractLayout, ConvertTensorExtractSlice, ConvertTensorPad,
+        ConvertTensorInsertLayout, ConvertTensorInsertSlice,
+        PreserveLinalgMatvecAsLinearTransform>(typeConverter, context);
     patterns.add<ConvertLinalgMatvecLayout, ConvertLinalgConv1D,
                  ConvertLinalgConv2D, ConvertLinalgConv2DNchwFchw,
                  ConvertLinalgConv1DNcwFcw>(typeConverter, context,

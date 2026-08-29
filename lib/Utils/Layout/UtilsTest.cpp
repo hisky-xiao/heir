@@ -1055,6 +1055,27 @@ TEST(UtilsTest, TestGetPaddingRelation) {
   // p = 1 => s = -1, out of bounds
   EXPECT_FALSE(rel.containsPointNoLocal({1, -1}).has_value());
 }
+TEST(UtilsTest, TestRelationSubset) {
+  // `from`: 2x4 box
+  auto from = getIntegerRelationFromIslStr(
+                  "{ [i0, i1] -> [ct, slot] : ct = 0 and slot = i0 + 4*i1 and "
+                  "0 <= i0 <= 3 and 0 <= i1 <= 1 }")
+                  .value();
+  // `to`: 1x4 sub-box (i1 = 0)
+  auto to = getIntegerRelationFromIslStr(
+                "{ [i0, i1] -> [ct, slot] : ct = 0 and slot = i0 and 0 <= i0 "
+                "<= 3 and i1 = 0 }")
+                .value();
+  EXPECT_TRUE(isRelationSubset(to, from));
+  EXPECT_FALSE(isRelationSubset(from, to));
+
+  // `outside`: point not in `from`
+  auto outside = getIntegerRelationFromIslStr(
+                     "{ [i0, i1] -> [ct, slot] : ct = 0 and slot = i0 + 5 and "
+                     "0 <= i0 <= 3 and i1 = 0 }")
+                     .value();
+  EXPECT_FALSE(isRelationSubset(outside, from));
+}
 
 }  // namespace
 }  // namespace heir

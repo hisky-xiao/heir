@@ -2,11 +2,15 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
 #include <limits>
+#include <map>
+#include <memory>
 #include <random>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -16,10 +20,13 @@
 #include "lib/Dialect/TensorExt/Transforms/RotationGroupKernel.h"
 #include "lib/Dialect/TensorExt/Transforms/ShiftScheme.h"
 #include "lib/Kernel/AbstractValue.h"
+#include "lib/Kernel/ArithmeticDag.h"
 #include "lib/Kernel/IRMaterializingVisitor.h"
 #include "lib/Utils/ADT/FrozenVector.h"
 #include "lib/Utils/Graph/Graph.h"
 #include "lib/Utils/Layout/Utils.h"
+#include "lib/Utils/Utils.h"
+#include "llvm/include/llvm/ADT/DenseSet.h"              // from @llvm-project
 #include "llvm/include/llvm/ADT/STLExtras.h"             // from @llvm-project
 #include "llvm/include/llvm/Support/Debug.h"             // from @llvm-project
 #include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"    // from @llvm-project
@@ -242,12 +249,6 @@ LogicalResult convertRemapOp(RemapOp op,
               "DenseIntElementsAttr";
   }
 
-  ShiftScheme scheme = shiftNetworks.findShiftScheme(mapping);
-  auto rotationGroups = scheme.rotationGroups;
-
-  assert(!rotationGroups.empty() &&
-         "Shift network must have at least one group");
-
   b.setInsertionPointAfter(op);
 
   // Could add a special case here if the numCiphertexts == 1, using
@@ -272,8 +273,72 @@ LogicalResult convertRemapOp(RemapOp op,
     ciphertexts.push_back(kernel::SSAValue(slice.getResult()));
   }
 
-  auto resultNodes = implementShiftNetwork(ciphertexts, mapping, scheme,
-                                           minSlotCount, dagElemType);
+  using NodeTy = kernel::ArithmeticDagNode<kernel::SSAValue>;
+  SmallVector<std::shared_ptr<NodeTy>> resultNodes;
+
+  // Build rotation-mask groups and collect distinct (sourceCt, rotation) pairs.
+  std::map<std::tuple<int64_t, int64_t, int64_t>, std::vector<double>> groups;
+  llvm::DenseSet<std::pair<int64_t, int64_t>> uniqueShifts;
+  for (const auto& [target, source] : mapping.getTargetToSource()) {
+    int64_t r = (source.slot - target.slot) % minSlotCount;
+    if (r < 0) r += minSlotCount;
+    uniqueShifts.insert({source.ct, r});
+    auto& mask = groups
+                     .try_emplace(std::make_tuple(target.ct, source.ct, r),
+                                  std::vector<double>(minSlotCount, 0.0))
+                     .first->second;
+    mask[target.slot] = 1.0;
+  }
+
+  // If the number of distinct rotation offsets is <= log2(N_slots), direct
+  // depth-1 rotation + plaintext masking uses at most `uniqueShifts` rotations
+  // at multiplicative depth 1, vs VVE's multi-stage log2(N) rotations and
+  // ~2·log2(N) masks.
+  int64_t maxDirectRotations =
+      static_cast<int64_t>(std::ceil(std::log2(minSlotCount)));
+
+  if (static_cast<int64_t>(uniqueShifts.size()) <= maxDirectRotations) {
+    SmallVector<std::shared_ptr<NodeTy>> cts;
+    for (const auto& ct : ciphertexts) {
+      cts.push_back(NodeTy::leaf(ct));
+    }
+
+    std::map<std::pair<int64_t, int64_t>, std::shared_ptr<NodeTy>>
+        rotationCache;
+    auto maskType = makeTensorType(dagElemType, {1, minSlotCount});
+    resultNodes.assign(numCiphertexts, nullptr);
+    for (auto& [key, mask] : groups) {
+      auto [targetCt, sourceCt, r] = key;
+      std::shared_ptr<NodeTy> rotated;
+      if (r == 0) {
+        rotated = cts[sourceCt];
+      } else {
+        auto [it, inserted] = rotationCache.try_emplace({sourceCt, r}, nullptr);
+        if (inserted) {
+          it->second = NodeTy::leftRotate(cts[sourceCt], r);
+        }
+        rotated = it->second;
+      }
+      auto [allZero, allOne] = allZeroAllOne(mask);
+      (void)allZero;
+      std::shared_ptr<NodeTy> term =
+          allOne ? rotated
+                 : NodeTy::mul(rotated, NodeTy::constantTensor(mask, maskType));
+      resultNodes[targetCt] = resultNodes[targetCt]
+                                  ? NodeTy::add(resultNodes[targetCt], term)
+                                  : term;
+    }
+    std::vector<double> zeros(minSlotCount, 0.0);
+    for (auto& node : resultNodes) {
+      if (!node) node = NodeTy::constantTensor(zeros, maskType);
+    }
+  } else {
+    ShiftScheme scheme = shiftNetworks.findShiftScheme(mapping);
+    assert(!scheme.rotationGroups.empty() &&
+           "Shift network must have at least one group");
+    resultNodes = implementShiftNetwork(ciphertexts, mapping, scheme,
+                                        minSlotCount, dagElemType);
+  }
 
   kernel::IRMaterializingVisitor visitor(singleCiphertextType);
   auto resultVectors = visitor.process(resultNodes, b);
